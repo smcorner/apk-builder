@@ -1,0 +1,131 @@
+name: Convert GitHub Repo to Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'Target GitHub Repository URL'
+        required: true
+      app_name:
+        description: 'Android App Name'
+        required: true
+        default: 'MyRepoApp'
+      framework_hint:
+        description: 'Detected Framework Hint'
+        required: false
+        default: 'auto'
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Preflight & Setup Java 21 + Node 20 + Android SDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Setup Flutter (if needed)
+        if: inputs.framework_hint == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: 2. Clone & Auto-Detect Framework
+        run: |
+          git clone --depth 1 "${{ inputs.repo_url }}" target-repo
+          cd target-repo
+          if [ -f "pubspec.yaml" ]; then
+            echo "STACK=flutter" >> $GITHUB_ENV
+          elif [ -f "package.json" ] && grep -q '"react-native"' package.json; then
+            echo "STACK=react-native" >> $GITHUB_ENV
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || [ -f "settings.gradle" ] || [ -f "settings.gradle.kts" ]; then
+            echo "STACK=android-native" >> $GITHUB_ENV
+          else
+            echo "STACK=web-capacitor" >> $GITHUB_ENV
+          fi
+
+      - name: 3. Compile APK (Flutter / React Native / Native / Capacitor 6)
+        run: |
+          mkdir -p out-apk
+          SAFE_NAME=$(echo "${{ inputs.app_name }}" | tr -cd '[:alnum:]_-')
+          [ -z "$SAFE_NAME" ] && SAFE_NAME="RepoApp"
+          PKG_ID="com.repo2apk.$(echo "$SAFE_NAME" | tr '[:upper:]' '[:lower:]')"
+
+          if [ "$STACK" = "flutter" ]; then
+            cd target-repo
+            flutter pub get
+            flutter build apk --release
+            cp build/app/outputs/flutter-apk/app-release.apk "../out-apk/${SAFE_NAME}-unsigned.apk"
+
+          elif [ "$STACK" = "react-native" ]; then
+            cd target-repo
+            npm install --legacy-peer-deps
+            cd android && chmod +x gradlew && ./gradlew assembleRelease --no-daemon
+            APK_FILE=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
+            cp "$APK_FILE" "../../out-apk/${SAFE_NAME}-unsigned.apk"
+
+          elif [ "$STACK" = "android-native" ]; then
+            cd target-repo
+            chmod +x gradlew || true
+            ./gradlew assembleDebug --no-daemon
+            APK_FILE=$(find . -path "*/build/outputs/apk/*.apk" | head -n 1)
+            cp "$APK_FILE" "../out-apk/${SAFE_NAME}-unsigned.apk"
+
+          else
+            cd target-repo
+            if [ -f "package.json" ]; then
+              npm install --legacy-peer-deps || true
+              npm run build || true
+            fi
+            mkdir -p ../www
+            for dir in dist build out public .; do
+              if [ -f "$dir/index.html" ]; then
+                cp -r "$dir"/* ../www/
+                break
+              fi
+            done
+            if [ ! -f "../www/index.html" ]; then
+              echo "<!doctype html><html><body style='background:#09090b;color:#fff;font-family:sans-serif;padding:24px'><h1>${{ inputs.app_name }}</h1><p>Built from ${{ inputs.repo_url }}</p></body></html>" > ../www/index.html
+            fi
+            rm -rf ../www/node_modules ../www/.git
+            cd ..
+            mkdir cap-wrapper && cd cap-wrapper
+            npm init -y
+            npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+            npx cap init "${{ inputs.app_name }}" "$PKG_ID" --web-dir="../www"
+            npx cap add android
+            npx cap sync android
+            cd android && chmod +x gradlew && ./gradlew assembleRelease --no-daemon
+            APK_FILE=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
+            cp "$APK_FILE" "../../out-apk/${SAFE_NAME}-unsigned.apk"
+          fi
+
+      - name: 4. Sign & Zipalign APK with Ephemeral Release Keystore
+        run: |
+          SAFE_NAME=$(echo "${{ inputs.app_name }}" | tr -cd '[:alnum:]_-')
+          [ -z "$SAFE_NAME" ] && SAFE_NAME="RepoApp"
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | tail -n 1)
+
+          keytool -genkeypair -v -keystore release.keystore -alias repo2apk             -keyalg RSA -keysize 2048 -validity 10000             -storepass android123 -keypass android123             -dname "CN=Repo2APK, OU=Mobile, O=GitHub, L=Cloud, S=Net, C=US"
+
+          "$BUILD_TOOLS/zipalign" -v -p 4 "out-apk/${SAFE_NAME}-unsigned.apk" "out-apk/${SAFE_NAME}-aligned.apk"
+          "$BUILD_TOOLS/apksigner" sign --ks release.keystore --ks-pass pass:android123             --key-pass pass:android123 --out "out-apk/${SAFE_NAME}.apk" "out-apk/${SAFE_NAME}-aligned.apk"
+          "$BUILD_TOOLS/apksigner" verify "out-apk/${SAFE_NAME}.apk"
+
+      - name: 5. Publish Direct .APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-build-${{ github.run_number }}
+          name: "${{ inputs.app_name }} v1.0.${{ github.run_number }}"
+          body: "Signed Android APK built from ${{ inputs.repo_url }}"
+          files: out-apk/*.apk
