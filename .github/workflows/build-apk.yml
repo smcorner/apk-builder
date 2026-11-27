@@ -18,6 +18,10 @@ on:
         description: 'Detected Stack Hint'
         required: false
         default: 'auto'
+      has_custom_logo:
+        description: 'Apply custom-logo.png from builder repo'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
@@ -25,7 +29,17 @@ permissions:
 jobs:
   build-sign-release:
     runs-on: ubuntu-latest
+    env:
+      IN_REPO_URL: ${{ inputs.repo_url }}
+      IN_APP_NAME: ${{ inputs.app_name }}
+      IN_PACKAGE_ID: ${{ inputs.package_id }}
+      IN_LOGO: ${{ inputs.has_custom_logo }}
     steps:
+      - name: Checkout Builder Repo (For Custom Logo)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Setup Node 20 & Java 21
         uses: actions/setup-node@v4
         with:
@@ -34,7 +48,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '21'
+          java-version: '17'
 
       - name: Setup Flutter SDK (When Flutter Repo Detected)
         if: inputs.stack_hint == 'flutter'
@@ -43,12 +57,18 @@ jobs:
           channel: 'stable'
 
       - name: Clone & Detect Stack
+        env:
+          TARGET_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
         run: |
-          RAW_URL="${{ inputs.repo_url }}"
+          RAW_URL="$IN_REPO_URL"
           CLEAN_URL=$(echo "$RAW_URL" | sed -E 's#(https://github.com/[^/]+/[^/]+).*#\1#')
           [[ "$CLEAN_URL" != http* ]] && CLEAN_URL="https://github.com/$CLEAN_URL"
           echo "Cloning $CLEAN_URL..."
-          git clone --depth 1 "$CLEAN_URL" target-repo
+          if [ -n "$TARGET_TOKEN" ]; then
+            git clone --depth 1 "https://x-access-token:$TARGET_TOKEN@github.com/${CLEAN_URL#https://github.com/}" target-repo
+          else
+            git clone --depth 1 "$CLEAN_URL" target-repo
+          fi
 
           cd target-repo
           if [ -f "pubspec.yaml" ]; then
@@ -59,20 +79,18 @@ jobs:
             echo "DETECTED_STACK=web-capacitor" >> $GITHUB_ENV
           fi
 
-      - name: Compile Android Binary
+      - name: Compile Native Android Binary
         run: |
           mkdir -p raw-apk
-          SAFE_APP_NAME=$(echo "${{ inputs.app_name }}" | tr -cd '[:alnum:] _-' | sed 's/^ *//;s/ *$//')
+          SAFE_APP_NAME=$(echo "$IN_APP_NAME" | tr -cd '[:alnum:] _-' | sed 's/^ *//;s/ *$//')
           [ -z "$SAFE_APP_NAME" ] && SAFE_APP_NAME="MyRepoApp"
           SAFE_FILE_NAME=$(echo "$SAFE_APP_NAME" | tr ' ' '_' | tr -cd '[:alnum:]_-')
           [ -z "$SAFE_FILE_NAME" ] && SAFE_FILE_NAME="MyRepoApp"
 
-          # Strictly sanitize Java/Android package ID (lowercase letters/digits/dots, no leading digits per segment)
-          RAW_PKG="${{ inputs.package_id }}"
+          RAW_PKG="$IN_PACKAGE_ID"
           [ -z "$RAW_PKG" ] && RAW_PKG="com.builder.${SAFE_FILE_NAME,,}"
-          SAFE_PKG=$(echo "$RAW_PKG" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.]/_/g' | sed -E 's/\.([0-9])/\.a\1/g' | sed -E 's/^([0-9])/a\1/')
+          SAFE_PKG=$(echo "$RAW_PKG" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.]/_/g' | sed -E 's/\.([0-9])/\.app\1/g' | sed -E 's/^([0-9])/app\1/')
           [[ "$SAFE_PKG" != *.* ]] && SAFE_PKG="com.builder.$SAFE_PKG"
-          echo "Using sanitized Package ID: $SAFE_PKG"
 
           if [ "$DETECTED_STACK" = "flutter" ]; then
             if ! command -v flutter >/dev/null 2>&1; then
@@ -83,7 +101,7 @@ jobs:
             flutter pub get
             flutter build apk --release
             APK_FOUND=$(find build/app/outputs -name "*.apk" | head -n 1)
-            cp "$APK_FOUND" "../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
+            [ -n "$APK_FOUND" ] || { echo "::error::Build produced no APK"; exit 1; }; cp "$APK_FOUND" "../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
 
           elif [ "$DETECTED_STACK" = "android-native" ]; then
             cd target-repo
@@ -93,8 +111,8 @@ jobs:
             else
               gradle assembleDebug --no-daemon
             fi
-            APK_FOUND=$(find . -path "*/build/outputs/apk/*.apk" | head -n 1)
-            cp "$APK_FOUND" "../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
+            APK_FOUND=$(find . -path "*/build/outputs/apk/*.apk" -not -path "*androidTest*" | head -n 1)
+            [ -n "$APK_FOUND" ] || { echo "::error::Build produced no APK"; exit 1; }; cp "$APK_FOUND" "../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
 
           else
             cd target-repo
@@ -104,70 +122,320 @@ jobs:
             fi
 
             mkdir -p ../web-dist
-            for dir in dist build out public _site .; do
+            FOUND_WEB=""
+            for dir in dist build out public _site docs www .; do
               if [ -f "$dir/index.html" ]; then
                 cp -r "$dir"/* ../web-dist/
+                FOUND_WEB="yes"
                 break
               fi
             done
 
-            if [ ! -f "../web-dist/index.html" ]; then
-              cat << 'EOF' > ../web-dist/index.html
-          <!doctype html>
-          <html lang="en">
-          <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GitHub Repo App</title></head>
-          <body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#f8fafc;font-family:system-ui,sans-serif;padding:24px;text-align:center">
-            <div style="max-width:420px;background:#1e293b;padding:28px;border-radius:20px;border:1px solid #334155">
-              <h1 style="margin:0 0 10px;font-size:22px">Android Wrapper Ready</h1>
-              <p style="margin:0;color:#94a3b8;font-size:14px;line-height:1.5">This repository was packaged into a native Android WebView container.</p>
-            </div>
-          </body>
-          </html>
-          EOF
+            if [ -z "$FOUND_WEB" ] && [ -f "manifest.json" ]; then
+              cp -r ./* ../web-dist/
+              EXT_ENTRY=$(python3 -c "import json; d=json.load(open('manifest.json')); print(d.get('action',{}).get('default_popup') or d.get('browser_action',{}).get('default_popup') or d.get('options_page') or '')" 2>/dev/null || true)
+              if [ -n "$EXT_ENTRY" ] && [ -f "../web-dist/$EXT_ENTRY" ]; then
+                cp "../web-dist/$EXT_ENTRY" ../web-dist/index.html
+                FOUND_WEB="yes"
+              fi
+            fi
+
+            if [ -z "$FOUND_WEB" ]; then
+              NESTED_HTML=$(find . -maxdepth 3 -name "index.html" -not -path "*/node_modules/*" | head -n 1)
+              if [ -n "$NESTED_HTML" ]; then
+                NESTED_DIR=$(dirname "$NESTED_HTML")
+                cp -r "$NESTED_DIR"/* ../web-dist/
+                FOUND_WEB="yes"
+              fi
+            fi
+
+            if [ -z "$FOUND_WEB" ]; then
+              cp -r ./* ../web-dist/ 2>/dev/null || true
+              python3 - << 'PYEOF'
+          import os, re, html
+          md_text = ""
+          for cand in ["README.md", "readme.md", "Readme.md", "INDEX.md"]:
+              if os.path.exists(cand):
+                  with open(cand, "r", encoding="utf-8", errors="ignore") as f:
+                      md_text = f.read()
+                  break
+          if not md_text:
+              files = [f for f in os.listdir(".") if not f.startswith(".")]
+              md_text = "# Repository Files\n\n" + "\n".join(f"- {x}" for x in sorted(files))
+
+          lines_html = []
+          for raw_line in md_text.splitlines():
+              line = raw_line.strip()
+              if not line: continue
+              if line.startswith("# "):
+                  lines_html.append(f"<h1 class='text-2xl font-extrabold text-white mt-4 mb-2'>{html.escape(line[2:])}</h1>")
+              elif line.startswith("## "):
+                  lines_html.append(f"<h2 class='text-lg font-bold text-emerald-400 mt-6 mb-2 border-b border-slate-700 pb-1'>{html.escape(line[3:])}</h2>")
+              elif line.startswith(("- ", "* ")):
+                  item = html.escape(line[2:])
+                  item = re.sub(r'\[([^\]]+)\]\((https?://[^)]+)\)', r'<a href="\2" target="_blank" class="text-emerald-400 underline font-semibold">\1</a>', item)
+                  lines_html.append(f"<div class='item-card p-3 rounded-xl bg-slate-800/90 border border-slate-700/80 mb-2 text-sm text-slate-200'>{item}</div>")
+              else:
+                  p = html.escape(line)
+                  p = re.sub(r'\[([^\]]+)\]\((https?://[^)]+)\)', r'<a href="\2" target="_blank" class="text-emerald-400 underline">\1</a>', p)
+                  lines_html.append(f"<p class='text-sm text-slate-300 mb-2 leading-relaxed'>{p}</p>")
+
+          page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>App</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 text-slate-100 min-h-screen p-4 pb-12 font-sans"><div class="max-w-xl mx-auto"><input id="q" type="search" placeholder="Search items & links..." oninput="filterCards()" class="w-full px-4 py-3 mb-4 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white outline-none"><div id="content">{''.join(lines_html)}</div></div><script>function filterCards(){{const t=document.getElementById('q').value.toLowerCase();document.querySelectorAll('.item-card').forEach(e=>e.style.display=e.textContent.toLowerCase().includes(t)?'':'none');}}</script></body></html>"""
+          with open("../web-dist/index.html", "w", encoding="utf-8") as out:
+              out.write(page)
+          PYEOF
             fi
 
             rm -rf ../web-dist/node_modules ../web-dist/.git
             cd ..
+
+            cat << 'JSEOF' > web-dist/_repo2apk_native.js
+          (function () {
+            if (!window.chrome) window.chrome = {};
+            if (!window.chrome.storage) {
+              const makeArea = (prefix) => ({
+                get: (keys, cb) => {
+                  const res = {};
+                  const list = Array.isArray(keys) ? keys : (typeof keys === 'string' ? [keys] : Object.keys(keys || {}));
+                  list.forEach(k => {
+                    try { const raw = localStorage.getItem(prefix + k); res[k] = raw !== null ? JSON.parse(raw) : undefined; } catch (e) {}
+                  });
+                  if (cb) cb(res);
+                  return Promise.resolve(res);
+                },
+                set: (items, cb) => {
+                  Object.keys(items || {}).forEach(k => { try { localStorage.setItem(prefix + k, JSON.stringify(items[k])); } catch (e) {} });
+                  if (cb) cb();
+                  return Promise.resolve();
+                }
+              });
+              window.chrome.storage = { local: makeArea('ext_local_'), sync: makeArea('ext_sync_') };
+            }
+            if (!window.chrome.runtime) window.chrome.runtime = { id: 'repo2apk-runtime', getURL: (p) => p };
+          })();
+          JSEOF
+
+            python3 - << 'PYPATCH'
+          import os, re
+          root = 'web-dist'
+          for dirpath, _, filenames in os.walk(root):
+              rel_dir = os.path.relpath(dirpath, root)
+              depth = 0 if rel_dir == '.' else len(rel_dir.split(os.sep))
+              prefix = './' if depth == 0 else '../' * depth
+              for fname in filenames:
+                  fpath = os.path.join(dirpath, fname)
+                  if fname.lower().endswith('.css'):
+                      with open(fpath, 'r', encoding='utf-8', errors='ignore') as f: css = f.read()
+                      css = re.sub(r'url\(\s*([\'"]?)/(?!/)', lambda m: f'url({m.group(1)}{prefix}', css)
+                      with open(fpath, 'w', encoding='utf-8') as f: f.write(css)
+                  elif fname.lower().endswith('.html'):
+                      with open(fpath, 'r', encoding='utf-8', errors='ignore') as f: html = f.read()
+                      def rewrite_attr(m):
+                          attr, quote, path = m.group(1), m.group(2), m.group(3)
+                          if attr.lower() == 'href':
+                              clean = path.split('#')[0].split('?')[0]
+                              if clean == '': return f'{attr}={quote}{prefix}index.html{quote}'
+                              cdir = os.path.join(root, clean.rstrip('/'))
+                              if os.path.isdir(cdir) and os.path.exists(os.path.join(cdir, 'index.html')):
+                                  return f'{attr}={quote}{prefix}{clean.rstrip("/")}/index.html{quote}'
+                          return f'{attr}={quote}{prefix}{path}{quote}'
+                      html = re.sub(r'\b(src|href|poster)=(["\'])/(?!/)([^"\']*)\2', rewrite_attr, html, flags=re.IGNORECASE)
+                      def rewrite_rel_dir(m):
+                          quote, path = m.group(1), m.group(2)
+                          if path.startswith(('http://', 'https://', 'mailto:', 'tel:', 'javascript:', '#', '.')): return m.group(0)
+                          clean = path.split('#')[0].split('?')[0].rstrip('/')
+                          if clean and not os.path.splitext(clean)[1] and os.path.exists(os.path.join(dirpath, clean, 'index.html')):
+                              return f'href={quote}{clean}/index.html{quote}'
+                          return m.group(0)
+                      html = re.sub(r'\bhref=(["\'])([^"\']+)\1', rewrite_rel_dir, html, flags=re.IGNORECASE)
+                      script_tag = f'<script src="{prefix}_repo2apk_native.js"></script>'
+                      if '_repo2apk_native.js' not in html:
+                          if re.search(r'</head>', html, flags=re.IGNORECASE):
+                              html = re.sub(r'</head>', script_tag + '\n</head>', html, count=1, flags=re.IGNORECASE)
+                          else:
+                              html = script_tag + '\n' + html
+                      with open(fpath, 'w', encoding='utf-8') as f: f.write(html)
+          PYPATCH
+
             mkdir cap-wrapper && cd cap-wrapper
             npm init -y
             npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
-            npx cap init "$SAFE_APP_NAME" "$SAFE_PKG" --web-dir="../web-dist"
+            cp -r ../web-dist www
+            npx cap init "$SAFE_APP_NAME" "$SAFE_PKG" --web-dir="www"
             npx cap add android
             npx cap sync android
+
+            # Apply Custom Logo across Android mipmap densities if uploaded
+            if [ "$IN_LOGO" = "true" ] && [ -f "../custom-logo.png" ]; then
+              python3 - << 'PYICON'
+          import os, glob, shutil, subprocess, sys
+          subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', 'pillow'], check=False)
+          try:
+              from PIL import Image
+          except Exception:
+              Image = None
+          sizes = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
+          fg_sizes = {'mdpi': 108, 'hdpi': 162, 'xhdpi': 216, 'xxhdpi': 324, 'xxxhdpi': 432}
+          src = Image.open('../custom-logo.png').convert('RGBA') if Image else None
+          for d in glob.glob('android/app/src/main/res/mipmap-*'):
+              dens = d.rsplit('-', 1)[-1]
+              if dens not in sizes: continue
+              for name in ['ic_launcher.png', 'ic_launcher_round.png', 'ic_launcher_foreground.png']:
+                  target = os.path.join(d, name)
+                  if not os.path.exists(target): continue
+                  if not src:
+                      shutil.copyfile('../custom-logo.png', target); continue
+                  if name == 'ic_launcher_foreground.png':
+                      fg = fg_sizes[dens]; inner = int(fg * 0.62)
+                      canvas = Image.new('RGBA', (fg, fg), (0, 0, 0, 0))
+                      logo = src.resize((inner, inner), Image.LANCZOS)
+                      canvas.paste(logo, ((fg - inner) // 2, (fg - inner) // 2), logo)
+                      canvas.save(target)
+                  else:
+                      src.resize((sizes[dens], sizes[dens]), Image.LANCZOS).save(target)
+          PYICON
+            fi
+
+            python3 - << 'PYANDROID'
+          import os, glob, re
+          manifest_path = 'android/app/src/main/AndroidManifest.xml'
+          if os.path.exists(manifest_path):
+              with open(manifest_path, 'r', encoding='utf-8') as f: am = f.read()
+              if 'ACCESS_NETWORK_STATE' not in am:
+                  am = am.replace('<uses-permission android:name="android.permission.INTERNET" />', '<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />')
+              if 'usesCleartextTraffic' not in am:
+                  am = am.replace('<application', '<application android:usesCleartextTraffic="true"')
+              with open(manifest_path, 'w', encoding='utf-8') as f: f.write(am)
+
+          java_files = glob.glob('android/app/src/main/java/**/MainActivity.java', recursive=True)
+          if java_files:
+              ma_path = java_files[0]
+              with open(ma_path, 'r', encoding='utf-8') as f: orig = f.read()
+              pkg_match = re.search(r'package\s+([a-zA-Z0-9_.]+);', orig)
+              pkg_name = pkg_match.group(1) if pkg_match else 'com.builder.repoapp'
+              native_java = f"""package {pkg_name};
+          import android.app.DownloadManager;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.webkit.CookieManager;
+          import android.webkit.DownloadListener;
+          import android.webkit.URLUtil;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import androidx.activity.OnBackPressedCallback;
+          import com.getcapacitor.BridgeActivity;
+          import com.getcapacitor.BridgeWebViewClient;
+          public class MainActivity extends BridgeActivity {{
+              @Override
+              public void onCreate(Bundle savedInstanceState) {{
+                  super.onCreate(savedInstanceState);
+                  WebView webView = getBridge().getWebView();
+                  WebSettings settings = webView.getSettings();
+                  settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  webView.setWebViewClient(new BridgeWebViewClient(getBridge()) {{
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {{
+                          Uri uri = request.getUrl();
+                          String scheme = uri.getScheme() != null ? uri.getScheme().toLowerCase() : "";
+                          String host = uri.getHost() != null ? uri.getHost().toLowerCase() : "";
+                          if ("localhost".equals(host) || "127.0.0.1".equals(host) || "file".equals(scheme)) return false;
+                          try {{ startActivity(new Intent(Intent.ACTION_VIEW, uri)); return true; }} catch (Exception e) {{ return super.shouldOverrideUrlLoading(view, request); }}
+                      }}
+                  }});
+                  webView.setDownloadListener(new DownloadListener() {{
+                      @Override
+                      public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimeType, long contentLength) {{
+                          try {{
+                              if (url.startsWith("http://") || url.startsWith("https://")) {{
+                                  DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+                                  req.setMimeType(mimeType);
+                                  req.addRequestHeader("cookie", CookieManager.getInstance().getCookie(url));
+                                  req.setTitle(URLUtil.guessFileName(url, contentDisposition, mimeType));
+                                  req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                                  req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, URLUtil.guessFileName(url, contentDisposition, mimeType));
+                                  DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                                  if (dm != null) dm.enqueue(req);
+                              }}
+                          }} catch (Exception ignored) {{}}
+                      }}
+                  }});
+                  getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {{
+                      @Override
+                      public void handleOnBackPressed() {{
+                          if (webView.canGoBack()) webView.goBack();
+                          else {{ setEnabled(false); getOnBackPressedDispatcher().onBackPressed(); }}
+                      }}
+                  }});
+              }}
+          }}
+          """
+              with open(ma_path, 'w', encoding='utf-8') as f: f.write(native_java)
+          PYANDROID
+
             cd android
             chmod +x gradlew
             ./gradlew assembleDebug --no-daemon
             APK_FOUND=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
-            cp "$APK_FOUND" "../../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
+            [ -n "$APK_FOUND" ] || { echo "::error::Build produced no APK"; exit 1; }; cp "$APK_FOUND" "../../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
           fi
 
       - name: Sign & Zipalign Android APK
+        id: sign
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS_IN: ${{ secrets.KEY_ALIAS }}
         run: |
-          SAFE_APP_NAME=$(echo "${{ inputs.app_name }}" | tr -cd '[:alnum:] _-' | sed 's/^ *//;s/ *$//')
+          SAFE_APP_NAME=$(echo "$IN_APP_NAME" | tr -cd '[:alnum:] _-' | sed 's/^ *//;s/ *$//')
           [ -z "$SAFE_APP_NAME" ] && SAFE_APP_NAME="MyRepoApp"
           SAFE_FILE_NAME=$(echo "$SAFE_APP_NAME" | tr ' ' '_' | tr -cd '[:alnum:]_-')
           [ -z "$SAFE_FILE_NAME" ] && SAFE_FILE_NAME="MyRepoApp"
+          echo "apk_filename=${SAFE_FILE_NAME}.apk" >> "$GITHUB_OUTPUT"
+          echo "release_tag=apk-$(echo "$SAFE_FILE_NAME" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
-          # Resolve Android SDK Build-Tools natively on runner
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           BUILD_TOOLS=$(ls -d "$SDK_ROOT/build-tools/"* 2>/dev/null | sort -V | tail -n 1)
 
-          keytool -genkeypair -v -keystore release.keystore -alias repo2apk \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass android123 -keypass android123 \
-            -dname "CN=Repo2APK, OU=Mobile, O=GitHub, L=Cloud, S=Net, C=US"
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PASS" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > release.keystore
+            KS_ALIAS="${KEY_ALIAS_IN:-repo2apk}"
+            KS_PASS="$KEYSTORE_PASS"
+            echo "Using your persistent signing key"
+          else
+            echo "::warning::No KEYSTORE_BASE64 secret set. Using a throwaway key, so installing a newer build over an older one needs an uninstall first."
+            KS_ALIAS="repo2apk"
+            KS_PASS="android123"
+            keytool -genkeypair -v -keystore release.keystore -alias repo2apk \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$KS_PASS" -keypass "$KS_PASS" \
+              -dname "CN=Repo2APK, OU=Mobile, O=GitHub, L=Cloud, ST=Net, C=US"
+          fi
 
           UNSIGNED="raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
           "$BUILD_TOOLS/zipalign" -f -p 4 "$UNSIGNED" "aligned.apk"
-          "$BUILD_TOOLS/apksigner" sign --ks release.keystore --ks-key-alias repo2apk \
-            --ks-pass pass:android123 --key-pass pass:android123 \
+          "$BUILD_TOOLS/apksigner" sign --ks release.keystore --ks-key-alias "$KS_ALIAS" \
+            --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
             --out "${SAFE_FILE_NAME}.apk" "aligned.apk"
-          "$BUILD_TOOLS/apksigner" verify "${SAFE_FILE_NAME}.apk"
+          "$BUILD_TOOLS/apksigner" verify --verbose "${SAFE_FILE_NAME}.apk"
+          rm -f "aligned.apk" "$UNSIGNED" raw-apk/*.apk release.keystore
+
+      - name: Replace Existing Release For This App
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REL_TAG: ${{ steps.sign.outputs.release_tag }}
+        run: |
+          gh release delete "$REL_TAG" --yes --cleanup-tag 2>/dev/null || true
 
       - name: Publish Direct .APK to GitHub Releases
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: apk-v${{ github.run_number }}
+          tag_name: ${{ steps.sign.outputs.release_tag }}
           name: "${{ inputs.app_name }} (Build #${{ github.run_number }})"
           body: "Signed Android APK compiled from ${{ inputs.repo_url }}"
-          files: "*.apk"
+          files: "${{ steps.sign.outputs.apk_filename }}"
