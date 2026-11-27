@@ -3,25 +3,11 @@ name: Convert GitHub Repo to Android APK
 on:
   workflow_dispatch:
     inputs:
-      repo_url:
-        description: 'Target GitHub Repository URL'
-        required: true
-      app_name:
-        description: 'Android App Name'
-        required: true
-        default: 'MyRepoApp'
-      package_id:
-        description: 'Sanitized Android Package ID'
-        required: false
-        default: 'com.builder.repoapp'
-      stack_hint:
-        description: 'Detected Stack Hint'
-        required: false
-        default: 'auto'
-      has_custom_logo:
-        description: 'Apply custom-logo.png from builder repo'
-        required: false
-        default: 'false'
+      repo_url: { description: 'Target GitHub Repository URL', required: true }
+      app_name: { description: 'Android App Name', required: true, default: 'MyRepoApp' }
+      package_id: { description: 'Sanitized Android Package ID', required: false, default: 'com.builder.repoapp' }
+      stack_hint: { description: 'Detected Stack Hint', required: false, default: 'auto' }
+      has_custom_logo: { description: 'Apply custom-logo.png from builder repo', required: false, default: 'false' }
 
 permissions:
   contents: write
@@ -40,7 +26,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Node 20 & Java 21
+      - name: Setup Node 20 & Java 17
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -69,7 +55,6 @@ jobs:
           else
             git clone --depth 1 "$CLEAN_URL" target-repo
           fi
-
           cd target-repo
           if [ -f "pubspec.yaml" ]; then
             echo "DETECTED_STACK=flutter" >> $GITHUB_ENV
@@ -78,6 +63,7 @@ jobs:
           else
             echo "DETECTED_STACK=web-capacitor" >> $GITHUB_ENV
           fi
+          echo "::notice::Detected stack: $(cat $GITHUB_ENV | grep DETECTED_STACK | cut -d= -f2)"
 
       - name: Compile Native Android Binary
         run: |
@@ -91,6 +77,7 @@ jobs:
           [ -z "$RAW_PKG" ] && RAW_PKG="com.builder.${SAFE_FILE_NAME,,}"
           SAFE_PKG=$(echo "$RAW_PKG" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.]/_/g' | sed -E 's/\.([0-9])/\.app\1/g' | sed -E 's/^([0-9])/app\1/')
           [[ "$SAFE_PKG" != *.* ]] && SAFE_PKG="com.builder.$SAFE_PKG"
+          echo "Package: $SAFE_PKG | App: $SAFE_APP_NAME | File: $SAFE_FILE_NAME"
 
           if [ "$DETECTED_STACK" = "flutter" ]; then
             if ! command -v flutter >/dev/null 2>&1; then
@@ -101,56 +88,69 @@ jobs:
             flutter pub get
             flutter build apk --release
             APK_FOUND=$(find build/app/outputs -name "*.apk" | head -n 1)
-            [ -n "$APK_FOUND" ] || { echo "::error::Build produced no APK"; exit 1; }; cp "$APK_FOUND" "../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
+            [ -n "$APK_FOUND" ] || { echo "::error::Build produced no APK"; exit 1; }
+            cp "$APK_FOUND" "../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
 
           elif [ "$DETECTED_STACK" = "android-native" ]; then
             cd target-repo
             chmod +x gradlew || true
-            if [ -f "gradlew" ]; then
-              ./gradlew assembleDebug --no-daemon
-            else
-              gradle assembleDebug --no-daemon
-            fi
+            if [ -f "gradlew" ]; then ./gradlew assembleDebug --no-daemon; else gradle assembleDebug --no-daemon; fi
             APK_FOUND=$(find . -path "*/build/outputs/apk/*.apk" -not -path "*androidTest*" | head -n 1)
-            [ -n "$APK_FOUND" ] || { echo "::error::Build produced no APK"; exit 1; }; cp "$APK_FOUND" "../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
+            [ -n "$APK_FOUND" ] || { echo "::error::Build produced no APK"; exit 1; }
+            cp "$APK_FOUND" "../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
 
           else
+            # ---- WEB STACK ----
             cd target-repo
+
             if [ -f "package.json" ]; then
-              npm install --legacy-peer-deps || true
-              npm run build || true
+              echo "::group::npm install / build"
+              npm install --legacy-peer-deps || echo "::warning::npm install had warnings"
+              npm run build || echo "::warning::npm run build had warnings (continuing)"
+              echo "::endgroup::"
             fi
 
             mkdir -p ../web-dist
             FOUND_WEB=""
-            for dir in dist build out public _site docs www .; do
+
+            # 1) Prefer real build output directories
+            for dir in dist build out .output public _site docs www web src .; do
               if [ -f "$dir/index.html" ]; then
-                cp -r "$dir"/* ../web-dist/
-                FOUND_WEB="yes"
+                echo "::notice::Using $dir/index.html as app entry"
+                cp -r "$dir"/. ../web-dist/ 2>/dev/null || true
+                FOUND_WEB="$dir"
                 break
               fi
             done
 
+            # 2) Fallback: any .html file, rename to index.html
+            if [ -z "$FOUND_WEB" ]; then
+              NESTED_HTML=$(find . -maxdepth 4 -name "*.html" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/android/*" 2>/dev/null | head -n 1)
+              if [ -n "$NESTED_HTML" ]; then
+                NESTED_DIR=$(dirname "$NESTED_HTML")
+                NESTED_NAME=$(basename "$NESTED_HTML")
+                echo "::notice::Found HTML entry $NESTED_HTML"
+                cp -r "$NESTED_DIR"/. ../web-dist/ 2>/dev/null || true
+                if [ "$NESTED_NAME" != "index.html" ] && [ ! -f "../web-dist/index.html" ]; then
+                  mv "../web-dist/$NESTED_NAME" ../web-dist/index.html
+                fi
+                FOUND_WEB="$NESTED_DIR"
+              fi
+            fi
+
+            # 3) Chrome extension: use popup as entry
             if [ -z "$FOUND_WEB" ] && [ -f "manifest.json" ]; then
-              cp -r ./* ../web-dist/
+              cp -r ./. ../web-dist/ 2>/dev/null || true
               EXT_ENTRY=$(python3 -c "import json; d=json.load(open('manifest.json')); print(d.get('action',{}).get('default_popup') or d.get('browser_action',{}).get('default_popup') or d.get('options_page') or '')" 2>/dev/null || true)
               if [ -n "$EXT_ENTRY" ] && [ -f "../web-dist/$EXT_ENTRY" ]; then
                 cp "../web-dist/$EXT_ENTRY" ../web-dist/index.html
-                FOUND_WEB="yes"
+                FOUND_WEB="ext"
               fi
             fi
 
+            # 4) Last resort: README landing page
             if [ -z "$FOUND_WEB" ]; then
-              NESTED_HTML=$(find . -maxdepth 3 -name "index.html" -not -path "*/node_modules/*" | head -n 1)
-              if [ -n "$NESTED_HTML" ]; then
-                NESTED_DIR=$(dirname "$NESTED_HTML")
-                cp -r "$NESTED_DIR"/* ../web-dist/
-                FOUND_WEB="yes"
-              fi
-            fi
-
-            if [ -z "$FOUND_WEB" ]; then
-              cp -r ./* ../web-dist/ 2>/dev/null || true
+              echo "::warning::No web entry found — generating README landing page"
               python3 - << 'PYEOF'
           import os, re, html
           md_text = ""
@@ -186,9 +186,10 @@ jobs:
           PYEOF
             fi
 
-            rm -rf ../web-dist/node_modules ../web-dist/.git
+            rm -rf ../web-dist/node_modules ../web-dist/.git ../web-dist/__pycache__ 2>/dev/null || true
             cd ..
 
+            # WebView polyfill for chrome.* APIs
             cat << 'JSEOF' > web-dist/_repo2apk_native.js
           (function () {
             if (!window.chrome) window.chrome = {};
@@ -197,9 +198,7 @@ jobs:
                 get: (keys, cb) => {
                   const res = {};
                   const list = Array.isArray(keys) ? keys : (typeof keys === 'string' ? [keys] : Object.keys(keys || {}));
-                  list.forEach(k => {
-                    try { const raw = localStorage.getItem(prefix + k); res[k] = raw !== null ? JSON.parse(raw) : undefined; } catch (e) {}
-                  });
+                  list.forEach(k => { try { const raw = localStorage.getItem(prefix + k); res[k] = raw !== null ? JSON.parse(raw) : undefined; } catch (e) {} });
                   if (cb) cb(res);
                   return Promise.resolve(res);
                 },
@@ -215,6 +214,7 @@ jobs:
           })();
           JSEOF
 
+            # Rewrite root-absolute & subpage links; inject polyfill script tag
             python3 - << 'PYPATCH'
           import os, re
           root = 'web-dist'
@@ -230,16 +230,20 @@ jobs:
                       with open(fpath, 'w', encoding='utf-8') as f: f.write(css)
                   elif fname.lower().endswith('.html'):
                       with open(fpath, 'r', encoding='utf-8', errors='ignore') as f: html = f.read()
+
                       def rewrite_attr(m):
                           attr, quote, path = m.group(1), m.group(2), m.group(3)
                           if attr.lower() == 'href':
                               clean = path.split('#')[0].split('?')[0]
                               if clean == '': return f'{attr}={quote}{prefix}index.html{quote}'
-                              cdir = os.path.join(root, clean.rstrip('/'))
+                              # FIX: os.path.join discards root when path starts with '/'
+                              cdir = os.path.join(root, clean.lstrip('/').rstrip('/'))
                               if os.path.isdir(cdir) and os.path.exists(os.path.join(cdir, 'index.html')):
-                                  return f'{attr}={quote}{prefix}{clean.rstrip("/")}/index.html{quote}'
-                          return f'{attr}={quote}{prefix}{path}{quote}'
+                                  return f'{attr}={quote}{prefix}{clean.lstrip("/").rstrip("/")}/index.html{quote}'
+                          return f'{attr}={quote}{prefix}{path.lstrip("/")}{quote}'
+
                       html = re.sub(r'\b(src|href|poster)=(["\'])/(?!/)([^"\']*)\2', rewrite_attr, html, flags=re.IGNORECASE)
+
                       def rewrite_rel_dir(m):
                           quote, path = m.group(1), m.group(2)
                           if path.startswith(('http://', 'https://', 'mailto:', 'tel:', 'javascript:', '#', '.')): return m.group(0)
@@ -247,7 +251,9 @@ jobs:
                           if clean and not os.path.splitext(clean)[1] and os.path.exists(os.path.join(dirpath, clean, 'index.html')):
                               return f'href={quote}{clean}/index.html{quote}'
                           return m.group(0)
+
                       html = re.sub(r'\bhref=(["\'])([^"\']+)\1', rewrite_rel_dir, html, flags=re.IGNORECASE)
+
                       script_tag = f'<script src="{prefix}_repo2apk_native.js"></script>'
                       if '_repo2apk_native.js' not in html:
                           if re.search(r'</head>', html, flags=re.IGNORECASE):
@@ -257,6 +263,7 @@ jobs:
                       with open(fpath, 'w', encoding='utf-8') as f: f.write(html)
           PYPATCH
 
+            # ---- Capacitor wrapper ----
             mkdir cap-wrapper && cd cap-wrapper
             npm init -y
             npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
@@ -265,7 +272,6 @@ jobs:
             npx cap add android
             npx cap sync android
 
-            # Apply Custom Logo across Android mipmap densities if uploaded
             if [ "$IN_LOGO" = "true" ] && [ -f "../custom-logo.png" ]; then
               python3 - << 'PYICON'
           import os, glob, shutil, subprocess, sys
@@ -296,6 +302,7 @@ jobs:
           PYICON
             fi
 
+            # ---- Manifest: INTERNET / NETWORK_STATE / cleartext ----
             python3 - << 'PYANDROID'
           import os, glob, re
           manifest_path = 'android/app/src/main/AndroidManifest.xml'
@@ -313,6 +320,8 @@ jobs:
               with open(ma_path, 'r', encoding='utf-8') as f: orig = f.read()
               pkg_match = re.search(r'package\s+([a-zA-Z0-9_.]+);', orig)
               pkg_name = pkg_match.group(1) if pkg_match else 'com.builder.repoapp'
+
+              # FIX: explicitly enable JavaScript + mixed content; keep the Capacitor bridge intact
               native_java = f"""package {pkg_name};
           import android.app.DownloadManager;
           import android.content.Intent;
@@ -334,16 +343,23 @@ jobs:
                   super.onCreate(savedInstanceState);
                   WebView webView = getBridge().getWebView();
                   WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
                   settings.setDomStorageEnabled(true);
                   settings.setDatabaseEnabled(true);
                   settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
+                  settings.setMediaPlaybackRequiresUserGesture(false);
+                  settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+                  settings.setCacheMode(WebSettings.LOAD_DEFAULT);
                   webView.setWebViewClient(new BridgeWebViewClient(getBridge()) {{
                       @Override
                       public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {{
                           Uri uri = request.getUrl();
                           String scheme = uri.getScheme() != null ? uri.getScheme().toLowerCase() : "";
                           String host = uri.getHost() != null ? uri.getHost().toLowerCase() : "";
-                          if ("localhost".equals(host) || "127.0.0.1".equals(host) || "file".equals(scheme)) return false;
+                          if ("localhost".equals(host) || "127.0.0.1".equals(host) || "file".equals(scheme)) {{
+                              return super.shouldOverrideUrlLoading(view, request);
+                          }}
                           try {{ startActivity(new Intent(Intent.ACTION_VIEW, uri)); return true; }} catch (Exception e) {{ return super.shouldOverrideUrlLoading(view, request); }}
                       }}
                   }});
@@ -381,7 +397,13 @@ jobs:
             chmod +x gradlew
             ./gradlew assembleDebug --no-daemon
             APK_FOUND=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
-            [ -n "$APK_FOUND" ] || { echo "::error::Build produced no APK"; exit 1; }; cp "$APK_FOUND" "../../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
+            [ -n "$APK_FOUND" ] || { echo "::error::Build produced no APK"; exit 1; }
+
+            # Sanity check that the APK actually contains the web assets
+            unzip -l "$APK_FOUND" | grep -q "assets/public/index.html" || echo "::warning::index.html not found at assets/public/ — checking alternate path"
+            unzip -l "$APK_FOUND" | grep -qE "assets/(public/)?index.html" || echo "::warning::APK does not contain index.html at a known path"
+
+            cp "$APK_FOUND" "../../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
           fi
 
       - name: Sign & Zipalign Android APK
@@ -407,7 +429,7 @@ jobs:
             KS_PASS="$KEYSTORE_PASS"
             echo "Using your persistent signing key"
           else
-            echo "::warning::No KEYSTORE_BASE64 secret set. Using a throwaway key, so installing a newer build over an older one needs an uninstall first."
+            echo "::warning::No KEYSTORE_BASE64 secret set. Using a throwaway key — installing a newer build needs uninstall first."
             KS_ALIAS="repo2apk"
             KS_PASS="android123"
             keytool -genkeypair -v -keystore release.keystore -alias repo2apk \
@@ -429,8 +451,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           REL_TAG: ${{ steps.sign.outputs.release_tag }}
-        run: |
-          gh release delete "$REL_TAG" --yes --cleanup-tag 2>/dev/null || true
+        run: gh release delete "$REL_TAG" --yes --cleanup-tag 2>/dev/null || true
 
       - name: Publish Direct .APK to GitHub Releases
         uses: softprops/action-gh-release@v2
